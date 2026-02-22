@@ -1,0 +1,102 @@
+/**
+ * Title: Multi-temporal LST and SUHI Analysis of Zielona Góra (2015-2025)
+ * Version: 3.0 (30% Cloud Threshold + Sensor/Metadata Analytics)
+ * Authors: [N.Pinar Ozguner Gulhan]
+ */
+
+// --- 1. RESEARCH ASSETS ---
+var urbanLULC = ee.FeatureCollection('projects/ee-pinarozguner/assets/UrbanAreas');
+var greenLULC = ee.FeatureCollection('projects/ee-pinarozguner/assets/GreenAreas');
+var cityBorder = ee.FeatureCollection('projects/ee-pinarozguner/assets/ZGBorders');
+
+var studyArea = cityBorder.geometry().buffer(5000).bounds();
+var urbanPolygons = urbanLULC.geometry();
+var greenPolygons = greenLULC.geometry();
+
+// --- 2. PRE-PROCESSING & CLOUD MASK ---
+function maskClouds(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloud = qa.bitwiseAnd(1 << 3).neq(0);
+  var cirrus = qa.bitwiseAnd(1 << 2).neq(0);
+  var shadow = qa.bitwiseAnd(1 << 4).neq(0);
+  return image.updateMask(cloud.or(cirrus).or(shadow).not());
+}
+
+// --- 3. LST PHYSICS ENGINE (Sobrino et al., 2004) ---
+var applyLST = function(image) {
+  var ndvi = image.normalizedDifference(['B5', 'B4']).rename('NDVI');
+  var Pv = ndvi.expression('((ndvi - 0.2) / (0.5 - 0.2))**2', {'ndvi': ndvi}).clamp(0, 1);
+  var epsilon = Pv.multiply(0.004).add(0.986);
+  var lst = image.select('B10').expression(
+    '(BT / (1 + (10.895 * BT / 14388) * log(eps))) - 273.15', {
+      'BT': image.select('B10'),
+      'eps': epsilon
+    }).rename('LST');
+    
+  return image.addBands([lst, ndvi]).clip(studyArea);
+};
+
+// --- 4. DATASET ASSEMBLY (SUMMER JJA) ---
+var collection = ee.ImageCollection("LANDSAT/LC08/C02/T1_TOA")
+  .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_TOA"))
+  .filterBounds(studyArea)
+  .filterDate('2015-01-01', '2025-12-31')
+  .filter(ee.Filter.calendarRange(6, 8, 'month'))
+  .filter(ee.Filter.lt('CLOUD_COVER', 30))
+  .map(maskClouds)
+  .map(applyLST);
+
+// --- 5. COMPREHENSIVE STATISTICAL ANALYSIS ---
+var years = ee.List.sequence(2015, 2025);
+
+var statsList = years.map(function(y) {
+  var yearCol = collection.filter(ee.Filter.calendarRange(y, y, 'year'));
+  var meanImg = yearCol.mean();
+  
+  // METADATA CALCULATIONS
+  var l8Count = yearCol.filter(ee.Filter.eq('SPACECRAFT_ID', 'LANDSAT_8')).size();
+  var l9Count = yearCol.filter(ee.Filter.eq('SPACECRAFT_ID', 'LANDSAT_9')).size();
+  var avgCloud = yearCol.aggregate_mean('CLOUD_COVER');
+  
+  // ZONAL TEMPERATURE STATS
+  var uTemp = meanImg.select('LST').reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: urbanPolygons, scale: 30, maxPixels: 1e9}).get('LST');
+  var gTemp = meanImg.select('LST').reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: greenPolygons, scale: 30, maxPixels: 1e9}).get('LST');
+  
+  return ee.Feature(null, {
+    'year': y,
+    'Urban_Mean_LST': uTemp,
+    'Green_Mean_LST': gTemp,
+    'SUHI_Intensity': ee.Number(uTemp).subtract(gTemp),
+    'Total_Images': yearCol.size(),
+    'Landsat_8_Count': l8Count,
+    'Landsat_9_Count': l9Count,
+    'Mean_Cloud_Cover_Pct': avgCloud
+  });
+});
+
+var finalTable = ee.FeatureCollection(ee.List(statsList)).filter(ee.Filter.notNull(['Urban_Mean_LST']));
+
+// --- 6. VISUALIZATION & EXPORTS ---
+var finalMedianLST = collection.select('LST').median();
+Map.centerObject(cityBorder, 11);
+Map.addLayer(finalMedianLST, {min: 25, max: 45, palette: ['blue', 'green', 'yellow', 'red']}, 'Final Gap-Free LST Map');
+
+// Export GeoTIFF Map
+Export.image.toDrive({
+  image: finalMedianLST,
+  description: 'ZG_Master_LST_Map_30pct',
+  scale: 30,
+  region: studyArea,
+  fileFormat: 'GeoTIFF'
+});
+
+// Export CSV Table with all Metadata
+Export.table.toDrive({
+  collection: finalTable,
+  description: 'ZG_Full_Technical_Stats_2015_2025',
+  fileFormat: 'CSV'
+});
+
+print('Technical Summary:', finalTable);
